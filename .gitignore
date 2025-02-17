@@ -1,0 +1,8 @@
+/venv
+.env
+/transcriptions
+/models
+/pipelines
+/audio_files
+*.rttm
+
