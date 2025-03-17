@@ -5,14 +5,20 @@ from pyannote.audio import Pipeline
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from pydub import AudioSegment
 import torch
-from datetime import date, timedelta
+from datetime import timedelta
 from math import floor
 import numpy as np
 from uuid import uuid4
+from storage.s3_storage import S3Storage
 
 
 TRANSCRIPTION_DIR = './transcriptions'
+RTTM_DIR = f'{TRANSCRIPTION_DIR}/rttm_files'
 AUDIO_DIR = './audio_files'
+MODEL_DIR = './models'
+MODEL_NAME = 'distil-small.en'
+
+TEMP_DIR = './temp'
 
 
 def ms_to_hh_mm_ss_str(sec):
@@ -23,21 +29,18 @@ def ms_to_hh_mm_ss_str(sec):
     return f'{x[0]}:{x[1]}:{x[2]}'
 
 
-def audio_prep(audio_file: str):
-    audio_formats = torchaudio.utils.ffmpeg_utils.get_audio_decoders()
-    print(audio_formats())
-
-
 class Audio:
-    def __init__(self, audio_filename: str, whisper_pipeline, pyannote_model_dir: str):
+    def __init__(self, audio_filename: str, whisper_pipeline, pyannote_model_dir: str, storage):
         self.transcription_id = uuid4()
         self.audio_file = audio_filename
         self.whisper_pipeline = whisper_pipeline.pipe
         self.whisper_dtype = whisper_pipeline.torch_dtype
-        self.np_dtype = np.float32 if whisper_pipeline.torch_dtype == torch.float32 else np.float16
         self.pyannote_model = pyannote_model_dir
         self.pyannote_pipeline = Pipeline.from_pretrained(self.pyannote_model)
         self.audio_segments = AudioSegment.from_wav(audio_filename).set_channels(1).set_frame_rate(16000)
+        self.transcription_filename = f'{TEMP_DIR}/{self.transcription_id}-{os.path.basename(self.audio_file)}-transcription.txt'
+        self.rttm_filename = f'{TEMP_DIR}/{self.transcription_id}-{os.path.basename(self.audio_file)}.rttm'
+        self.storage = storage
 
     def diarize(self):
         waveform, sample_rate = torchaudio.load(self.audio_file)
@@ -49,14 +52,17 @@ class Audio:
                 "sample_rate": sample_rate
                 }, hook=hook
             )
+
         # dump the diarization output to disk using RTTM format
-        self.rttm_filename = f"{TRANSCRIPTION_DIR}/{self.transcription_id}-{os.path.basename(self.audio_file)}.rttm"
         rttm = diarization.to_rttm()
         self.rttm_lines = rttm.split('\n')[:-1]
 
-        # should do this in separate process
         with open(self.rttm_filename, "w") as rttm:
             diarization.write_rttm(rttm)
+        # Save rttm file to S3 and delete temp
+        s3_rttm_filename = self.rttm_filename.replace(f'{TEMP_DIR}/', '')
+        print(f'Saving {s3_rttm_filename} to S3 storage')
+        self.storage.new_file(s3_rttm_filename, self.rttm_filename)
 
         last_speaker = ''
         for line in self.rttm_lines:
@@ -80,15 +86,13 @@ class Audio:
                     new_times.append([start_time, new_end_time])
                     start_time = end_time
                     new_end_time = start_time + offset
-                    print(start_time, new_end_time)
 
-                print(new_times)
                 for new_start, new_end in new_times:
                     audio_seg.append(self.audio_segments[new_start*1000:new_end*1000])
 
             for audio in audio_seg:
                 raw_data = audio.raw_data
-                audio_array = np.frombuffer(raw_data, dtype=np.int16).astype(self.np_dtype) / 32768.0
+                audio_array = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
 
                 result = self.whisper_pipeline(audio_array)
                 transcription = transcription + result['text']
@@ -98,12 +102,16 @@ class Audio:
             else:
                 output = f'{speaker}: [{ms_to_hh_mm_ss_str(start_time)}->{ms_to_hh_mm_ss_str(end_time)}] {transcription}\n\n'
 
-            print(output)
-
-            with open(f'{TRANSCRIPTION_DIR}/{self.transcription_id}-{os.path.basename(self.audio_file)}-transcription.txt', 'a') as f:
+            with open(self.transcription_filename, 'a') as f:
                 f.write(output)
 
             last_speaker = speaker
+        # Write file to S3 and delete temp
+        s3_transcription_filename = self.transcription_filename.replace(f'{TEMP_DIR}/', '')
+        print(f'Storing {s3_transcription_filename} to S3 storage')
+        self.storage.new_file(s3_transcription_filename, self.transcription_filename)
+        os.remove(self.rttm_filename)
+        os.remove(self.transcription_filename)
 
 
 class Whisper:
@@ -125,19 +133,20 @@ class Whisper:
             model=model,
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
-            max_new_tokens=128,
             torch_dtype=self.torch_dtype,
             device_map=self.device,
+            generate_kwargs={"max_new_tokens": 128}
         )
 
         self.pipe = pipe
 
 
-if __name__ == "__main__":
-    audio_prep('./audio_files/audio.wav')
-#    whisper_pipeline = Whisper(whisper_model_dir='distil-whisper/distil-small.en')
-#    audio = Audio(
-#            audio_filename="./audio_files/audio.wav",
-#            pyannote_model_dir="./models/config.yaml",
-#            whisper_pipeline=whisper_pipeline)
-#    audio.diarize()
+def run_transcription(audio_file: str):
+    storage = S3Storage(host='localhost', port=9000, access_key='ROOTUSER', secret_key='Testpass321', bucket_name='testing')
+    whisper_pipeline = Whisper(whisper_model_dir=f'{MODEL_DIR}/{MODEL_NAME}')
+    audio = Audio(
+            audio_filename=audio_file,
+            pyannote_model_dir=f"{MODEL_DIR}/config.yaml",
+            whisper_pipeline=whisper_pipeline,
+            storage=storage)
+    audio.diarize()
