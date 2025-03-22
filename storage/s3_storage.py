@@ -40,15 +40,20 @@ class S3Storage:
         except Exception as e:
             print(f'Error creating bucket: {e}')
 
-    def new_file(self, object_name, file_name):
+    def new_file(self, file_name):
+        object_name = os.path.basename(file_name)
         client = self.get_client()
         try:
             client.fput_object(self.bucket_name, object_name, file_name)
         except Exception as e:
             print(f'Error uploading {e}')
 
-    def get(self, transcription_id: int):
-        pass
+    def get(self, transcription_id: int, file_name: str):
+        client = self.get_client()
+        object_name = f'{transcription_id}-{os.path.basename(file_name)}-transcription.txt'
+        response = client.get_object(self.bucket_name, object_name)
+        return response.data.decode('utf-8')
 
-    def append(self, transcription_id: int, new_data: str):
-        pass
+    def upload_content(self, key: str, content: str):
+        client = self.get_client()
+        client.put_object(self.bucket_name, key, content)

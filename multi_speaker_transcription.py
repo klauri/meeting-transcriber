@@ -9,7 +9,8 @@ from datetime import timedelta
 from math import floor
 import numpy as np
 from uuid import uuid4
-from storage.s3_storage import S3Storage
+from rq import Queue
+from transcription_worker import process_audio_segment
 
 
 TRANSCRIPTION_DIR = './transcriptions'
@@ -38,9 +39,10 @@ class Audio:
         self.pyannote_model = pyannote_model_dir
         self.pyannote_pipeline = Pipeline.from_pretrained(self.pyannote_model)
         self.audio_segments = AudioSegment.from_wav(audio_filename).set_channels(1).set_frame_rate(16000)
-        self.transcription_filename = f'{TEMP_DIR}/{self.transcription_id}-{os.path.basename(self.audio_file)}-transcription.txt'
-        self.rttm_filename = f'{TEMP_DIR}/{self.transcription_id}-{os.path.basename(self.audio_file)}.rttm'
+        self.transcription_key = f'{self.transcription_id}-{os.path.basename(self.audio_file)}-transcription.txt'
+        self.rttm_key = f'{self.transcription_id}-{os.path.basename(self.audio_file)}.rttm'
         self.storage = storage
+        self.queue = Queue('transcription')
 
     def diarize(self):
         waveform, sample_rate = torchaudio.load(self.audio_file)
@@ -53,30 +55,27 @@ class Audio:
                 }, hook=hook
             )
 
-        # dump the diarization output to disk using RTTM format
-        rttm = diarization.to_rttm()
-        self.rttm_lines = rttm.split('\n')[:-1]
+        # Get the RTTM content directly
+        rttm_content = diarization.to_rttm()
+        self.rttm_lines = rttm_content.split('\n')[:-1]
 
-        with open(self.rttm_filename, "w") as rttm:
-            diarization.write_rttm(rttm)
-        # Save rttm file to S3 and delete temp
-        s3_rttm_filename = self.rttm_filename.replace(f'{TEMP_DIR}/', '')
-        print(f'Saving {s3_rttm_filename} to S3 storage')
-        self.storage.new_file(s3_rttm_filename, self.rttm_filename)
+        # Upload RTTM content directly to S3
+        self.storage.upload_content(self.rttm_key, rttm_content)
 
+        # Create jobs for each segment
+        jobs = []
         last_speaker = ''
+        
         for line in self.rttm_lines:
             x = line.split(' ')
             start_time = float(x[3])
             duration = float(x[4])
             speaker = x[7]
             end_time = start_time + duration
-            audio_seg = []
-            transcription = ''
-            output = ''
+            audio_segments = []
 
             if duration < 30.0:
-                audio_seg.append(self.audio_segments[start_time*1000:(start_time+duration)*1000])
+                audio_segments.append(self.audio_segments[start_time*1000:(start_time+duration)*1000])
             else:
                 num_splits = duration / 30.0
                 offset = duration / num_splits
@@ -88,30 +87,47 @@ class Audio:
                     new_end_time = start_time + offset
 
                 for new_start, new_end in new_times:
-                    audio_seg.append(self.audio_segments[new_start*1000:new_end*1000])
+                    audio_segments.append(self.audio_segments[new_start*1000:new_end*1000])
 
-            for audio in audio_seg:
-                raw_data = audio.raw_data
-                audio_array = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+            # Queue each segment for processing
+            for audio_seg in audio_segments:
+                job_data = {
+                    'audio_segment': audio_seg,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'speaker': speaker,
+                    'storage': self.storage,
+                    'transcription_id': self.transcription_id,
+                    'audio_file': self.audio_file
+                }
+                jobs.append(self.queue.enqueue(process_audio_segment, job_data))
 
-                result = self.whisper_pipeline(audio_array)
-                transcription = transcription + result['text']
+        # Wait for all jobs to complete and collect results
+        results = []
+        for job in jobs:
+            result = job.result
+            results.append(result)
+
+        # Format and write results
+        transcription_buffer = []
+        last_speaker = ''
+        
+        for result in sorted(results, key=lambda x: x['start_time']):
+            start_time = result['start_time']
+            end_time = result['end_time']
+            speaker = result['speaker']
+            transcription = result['transcription']
 
             if speaker == last_speaker:
                 output = f'[{ms_to_hh_mm_ss_str(start_time)}->{ms_to_hh_mm_ss_str(end_time)}] {transcription}\n'
             else:
                 output = f'{speaker}: [{ms_to_hh_mm_ss_str(start_time)}->{ms_to_hh_mm_ss_str(end_time)}] {transcription}\n\n'
 
-            with open(self.transcription_filename, 'a') as f:
-                f.write(output)
-
+            transcription_buffer.append(output)
             last_speaker = speaker
-        # Write file to S3 and delete temp
-        s3_transcription_filename = self.transcription_filename.replace(f'{TEMP_DIR}/', '')
-        print(f'Storing {s3_transcription_filename} to S3 storage')
-        self.storage.new_file(s3_transcription_filename, self.transcription_filename)
-        os.remove(self.rttm_filename)
-        os.remove(self.transcription_filename)
+
+        # Upload the complete transcription to S3
+        self.storage.upload_content(self.transcription_key, ''.join(transcription_buffer))
 
 
 class Whisper:
@@ -141,8 +157,7 @@ class Whisper:
         self.pipe = pipe
 
 
-def run_transcription(audio_file: str):
-    storage = S3Storage(host='localhost', port=9000, access_key='ROOTUSER', secret_key='Testpass321', bucket_name='testing')
+def run_transcription(audio_file: str, storage):
     whisper_pipeline = Whisper(whisper_model_dir=f'{MODEL_DIR}/{MODEL_NAME}')
     audio = Audio(
             audio_filename=audio_file,
