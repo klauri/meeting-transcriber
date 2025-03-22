@@ -11,6 +11,39 @@ import numpy as np
 from uuid import uuid4
 from rq import Queue
 from transcription_worker import process_audio_segment
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
+
+class TimestampPosition(Enum):
+    START = "start"  # Timestamp at the start of the segment
+    ACTUAL = "actual"  # Timestamp at the actual speech position
+
+@dataclass
+class TranscriptionFormat:
+    include_speakers: bool = True
+    include_timestamps: bool = True
+    timestamp_position: TimestampPosition = TimestampPosition.START
+    include_transcription: bool = True
+    format_name: str = "full"  # Name for the output file
+
+    @classmethod
+    def speakers_only(cls):
+        return cls(include_speakers=True, include_timestamps=False, include_transcription=True, format_name="speakers")
+
+    @classmethod
+    def timestamps_only(cls):
+        return cls(include_speakers=False, include_timestamps=True, include_transcription=True, format_name="timestamps")
+
+    @classmethod
+    def transcription_only(cls):
+        return cls(include_speakers=False, include_timestamps=False, include_transcription=True, format_name="transcription")
+
+    @classmethod
+    def full_format(cls, timestamp_position: TimestampPosition = TimestampPosition.START):
+        return cls(include_speakers=True, include_timestamps=True, 
+                  timestamp_position=timestamp_position, include_transcription=True,
+                  format_name="full")
 
 
 TRANSCRIPTION_DIR = './transcriptions'
@@ -31,7 +64,7 @@ def ms_to_hh_mm_ss_str(sec):
 
 
 class Audio:
-    def __init__(self, audio_filename: str, whisper_pipeline, pyannote_model_dir: str, storage):
+    def __init__(self, audio_filename: str, whisper_pipeline, pyannote_model_dir: str, storage, output_formats: Optional[List[TranscriptionFormat]] = None):
         self.transcription_id = uuid4()
         self.audio_file = audio_filename
         self.whisper_pipeline = whisper_pipeline.pipe
@@ -39,10 +72,98 @@ class Audio:
         self.pyannote_model = pyannote_model_dir
         self.pyannote_pipeline = Pipeline.from_pretrained(self.pyannote_model)
         self.audio_segments = AudioSegment.from_wav(audio_filename).set_channels(1).set_frame_rate(16000)
-        self.transcription_key = f'{self.transcription_id}-{os.path.basename(self.audio_file)}-transcription.txt'
-        self.rttm_key = f'{self.transcription_id}-{os.path.basename(self.audio_file)}.rttm'
         self.storage = storage
         self.queue = Queue('transcription')
+        
+        # If no formats specified, use full format as default
+        self.output_formats = output_formats or [TranscriptionFormat.full_format()]
+        
+        # Generate keys for each format
+        self.transcription_keys = {
+            format: f'{self.transcription_id}-{os.path.basename(self.audio_file)}-{format.format_name}-transcription.txt'
+            for format in self.output_formats
+        }
+        self.rttm_key = f'{self.transcription_id}-{os.path.basename(self.audio_file)}.rttm'
+
+    def split_audio_into_chunks(self, audio_segment, chunk_duration_ms=30000):
+        """Split audio into chunks of specified duration."""
+        chunks = []
+        duration = len(audio_segment)
+        for i in range(0, duration, chunk_duration_ms):
+            chunk = audio_segment[i:i + chunk_duration_ms]
+            chunks.append(chunk)
+        return chunks
+
+    def format_transcription_line(self, result, format: TranscriptionFormat):
+        """Format a single transcription line based on the output format configuration."""
+        start_time = result['start_time']
+        end_time = result['end_time']
+        speaker = result['speaker']
+        transcription = result['transcription']
+        
+        parts = []
+        
+        # Add speaker if configured
+        if format.include_speakers:
+            parts.append(f"{speaker}:")
+        
+        # Add timestamps if configured
+        if format.include_timestamps:
+            timestamp = f"[{ms_to_hh_mm_ss_str(start_time)}->{ms_to_hh_mm_ss_str(end_time)}]"
+            if format.timestamp_position == TimestampPosition.START:
+                parts.insert(0, timestamp)
+            else:
+                parts.append(timestamp)
+        
+        # Add transcription (always included)
+        parts.append(transcription)
+        
+        return " ".join(parts) + "\n"
+
+    def process_results(self, results):
+        """Process results and generate output for each format."""
+        # Sort results by start time
+        sorted_results = sorted(results, key=lambda x: x['start_time'])
+        
+        # Generate output for each format
+        for format in self.output_formats:
+            transcription_buffer = []
+            for result in sorted_results:
+                transcription_buffer.append(self.format_transcription_line(result, format))
+            
+            # Upload the formatted transcription to S3
+            self.storage.upload_content(self.transcription_keys[format], ''.join(transcription_buffer))
+
+    def transcribe(self):
+        """Transcribe audio without diarization."""
+        # Split audio into 30-second chunks
+        chunks = self.split_audio_into_chunks(self.audio_segments)
+        
+        # Queue each chunk for processing
+        jobs = []
+        for i, chunk in enumerate(chunks):
+            start_time = i * 30  # Each chunk is 30 seconds
+            end_time = start_time + 30
+            
+            job_data = {
+                'audio_segment': chunk,
+                'start_time': start_time,
+                'end_time': end_time,
+                'speaker': 'SPEAKER_00',  # Default speaker for non-diarized transcription
+                'storage': self.storage,
+                'transcription_id': self.transcription_id,
+                'audio_file': self.audio_file
+            }
+            jobs.append(self.queue.enqueue(process_audio_segment, job_data))
+
+        # Wait for all jobs to complete and collect results
+        results = []
+        for job in jobs:
+            result = job.result
+            results.append(result)
+
+        # Process results for all formats
+        self.process_results(results)
 
     def diarize(self):
         waveform, sample_rate = torchaudio.load(self.audio_file)
@@ -64,7 +185,6 @@ class Audio:
 
         # Create jobs for each segment
         jobs = []
-        last_speaker = ''
         
         for line in self.rttm_lines:
             x = line.split(' ')
@@ -108,26 +228,8 @@ class Audio:
             result = job.result
             results.append(result)
 
-        # Format and write results
-        transcription_buffer = []
-        last_speaker = ''
-        
-        for result in sorted(results, key=lambda x: x['start_time']):
-            start_time = result['start_time']
-            end_time = result['end_time']
-            speaker = result['speaker']
-            transcription = result['transcription']
-
-            if speaker == last_speaker:
-                output = f'[{ms_to_hh_mm_ss_str(start_time)}->{ms_to_hh_mm_ss_str(end_time)}] {transcription}\n'
-            else:
-                output = f'{speaker}: [{ms_to_hh_mm_ss_str(start_time)}->{ms_to_hh_mm_ss_str(end_time)}] {transcription}\n\n'
-
-            transcription_buffer.append(output)
-            last_speaker = speaker
-
-        # Upload the complete transcription to S3
-        self.storage.upload_content(self.transcription_key, ''.join(transcription_buffer))
+        # Process results for all formats
+        self.process_results(results)
 
 
 class Whisper:
@@ -157,11 +259,16 @@ class Whisper:
         self.pipe = pipe
 
 
-def run_transcription(audio_file: str, storage):
+def run_transcription(audio_file: str, storage, use_diarization: bool = False, output_formats: Optional[List[TranscriptionFormat]] = None):
     whisper_pipeline = Whisper(whisper_model_dir=f'{MODEL_DIR}/{MODEL_NAME}')
     audio = Audio(
             audio_filename=audio_file,
             pyannote_model_dir=f"{MODEL_DIR}/config.yaml",
             whisper_pipeline=whisper_pipeline,
-            storage=storage)
-    audio.diarize()
+            storage=storage,
+            output_formats=output_formats)
+    
+    if use_diarization:
+        audio.diarize()
+    else:
+        audio.transcribe()
