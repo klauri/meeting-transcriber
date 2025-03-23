@@ -1,5 +1,5 @@
 from rq import Worker, Queue, Connection
-from multi_speaker_transcription import Whisper
+from whisper_model import Whisper
 import os
 import numpy as np
 

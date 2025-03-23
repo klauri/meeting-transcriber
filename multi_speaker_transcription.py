@@ -14,6 +14,7 @@ from transcription_worker import process_audio_segment
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
+from whisper_model import Whisper
 
 class TimestampPosition(Enum):
     START = "start"  # Timestamp at the start of the segment
@@ -80,7 +81,7 @@ class Audio:
         
         # Generate keys for each format
         self.transcription_keys = {
-            format: f'{self.transcription_id}-{os.path.basename(self.audio_file)}-{format.format_name}-transcription.txt'
+            format.format_name: f'{self.transcription_id}-{os.path.basename(self.audio_file)}-{format.format_name}-transcription.txt'
             for format in self.output_formats
         }
         self.rttm_key = f'{self.transcription_id}-{os.path.basename(self.audio_file)}.rttm'
@@ -132,7 +133,7 @@ class Audio:
                 transcription_buffer.append(self.format_transcription_line(result, format))
             
             # Upload the formatted transcription to S3
-            self.storage.upload_content(self.transcription_keys[format], ''.join(transcription_buffer))
+            self.storage.upload_content(self.transcription_keys[format.format_name], ''.join(transcription_buffer))
 
     def transcribe(self):
         """Transcribe audio without diarization."""
@@ -230,33 +231,6 @@ class Audio:
 
         # Process results for all formats
         self.process_results(results)
-
-
-class Whisper:
-    def __init__(self, whisper_model_dir: str):
-        self.whisper_model_dir = whisper_model_dir
-        self.device = "cuda:0" if torch.cuda.is_available() else torch.float32
-        self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        self.init_model()
-
-    def init_model(self):
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.whisper_model_dir, torch_dtype=self.torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
-        )
-
-        processor = AutoProcessor.from_pretrained(self.whisper_model_dir)
-
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            torch_dtype=self.torch_dtype,
-            device_map=self.device,
-            generate_kwargs={"max_new_tokens": 128}
-        )
-
-        self.pipe = pipe
 
 
 def run_transcription(audio_file: str, storage, use_diarization: bool = False, output_formats: Optional[List[TranscriptionFormat]] = None):

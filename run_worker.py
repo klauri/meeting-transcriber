@@ -6,7 +6,9 @@ from redis import Redis
 redis_conn = Redis(
     host=os.getenv('REDIS_HOST', 'localhost'),
     port=int(os.getenv('REDIS_PORT', 6379)),
-    db=int(os.getenv('REDIS_DB', 0))
+    db=int(os.getenv('REDIS_DB', 0)),
+    username=os.getenv('REDIS_USERNAME', 'taskrunner'),
+    password=os.getenv('REDIS_PASSWORD', 'msgpass321')
 )
 
 if __name__ == '__main__':

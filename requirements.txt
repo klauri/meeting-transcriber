@@ -39,7 +39,7 @@ mdurl==0.1.2
 mpmath==1.3.0
 multidict==6.1.0
 networkx==3.4.2
-numpy==2.2.3
+numpy==1.24.3
 omegaconf==2.3.0
 optuna==4.2.1
 packaging==24.2
@@ -59,13 +59,16 @@ pydub==0.25.1
 Pygments==2.19.1
 pyparsing==3.2.1
 python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
 pytorch-lightning==2.5.0.post0
 pytorch-metric-learning==2.8.1
 pytz==2025.1
 PyYAML==6.0.2
+redis==5.0.1
 regex==2024.11.6
 requests==2.32.3
 rich==13.9.4
+rq==1.15.1
 ruamel.yaml==0.18.10
 ruamel.yaml.clib==0.2.12
 safetensors==0.5.2
@@ -84,12 +87,12 @@ tabulate==0.9.0
 tensorboardX==2.6.2.2
 threadpoolctl==3.5.0
 tokenizers==0.21.0
-torch==2.6.0
+torch==2.2.0
 torch-audiomentations==0.12.0
 torch_pitch_shift==1.2.5
-torchaudio==2.6.0
+torchaudio==2.2.0
 torchmetrics==1.6.1
-torchvision==0.21.0
+torchvision==0.17.0
 tqdm==4.67.1
 transformers==4.48.3
 typer==0.15.1
@@ -97,5 +100,3 @@ typing_extensions==4.12.2
 tzdata==2025.1
 urllib3==2.3.0
 yarl==1.18.3
-rq==1.15.1
-redis==5.0.1
